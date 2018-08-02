@@ -21,10 +21,10 @@ index d2a4edd2a7..da4235f0f4 100644
  range.$(OBJEXT): {$(VPATH)}range.c $(RUBY_H_INCLUDES) \
 diff --git a/profiler.c b/profiler.c
 new file mode 100644
-index 0000000000..528ea98480
+index 0000000000..8e7f5be96b
 --- /dev/null
 +++ b/profiler.c
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,431 @@
 +#include "ruby/ruby.h"
 +#include "ruby/st.h"
 +#include "vm_core.h"
@@ -322,11 +322,15 @@ index 0000000000..528ea98480
 +    char* tick = getenv("RUBY_PROFILER_TICK");
 +
 +    if (tick) {
-+        state->sample_tick = atoi(tick);
++        int tick_value = atoi(tick);
++
++        if(tick_value > SAMPLE_TICK) {
++            state->sample_tick = tick_value;
++            return;
++        }
 +    }
-+    else {
-+        state->sample_tick = SAMPLE_TICK;
-+    }
++
++    state->sample_tick = SAMPLE_TICK;
 +}
 +
 +static void
