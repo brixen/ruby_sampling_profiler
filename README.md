@@ -57,6 +57,11 @@ docs](https://rvm.io/rubies/patching).
 
     $ rvm install 2.1.10 --patch https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-2.1/profiler.diff
 
-# License
+## References
+
+1. [Evaluating the Accuracy of Java Profilers](https://plv.colorado.edu/papers/mytkowicz-pldi10.pdf)
+1. [Statistically Rigorous Java Performance Evaluation](https://dri.es/files/oopsla07-georges.pdf)
+
+## License
 
 See LICENSE
