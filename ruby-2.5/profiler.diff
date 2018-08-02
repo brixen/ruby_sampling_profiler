@@ -1,0 +1,475 @@
+diff --git a/common.mk b/common.mk
+index 2175f67eba..7556d1c5bd 100644
+--- a/common.mk
++++ b/common.mk
+@@ -102,6 +102,7 @@ COMMONOBJS    = array.$(OBJEXT) \
+ 		parse.$(OBJEXT) \
+ 		proc.$(OBJEXT) \
+ 		process.$(OBJEXT) \
++		profiler.$(OBJEXT) \
+ 		random.$(OBJEXT) \
+ 		range.$(OBJEXT) \
+ 		rational.$(OBJEXT) \
+diff --git a/profiler.c b/profiler.c
+new file mode 100644
+index 0000000000..5b942477e5
+--- /dev/null
++++ b/profiler.c
+@@ -0,0 +1,431 @@
++#include "ruby/ruby.h"
++#include "ruby/st.h"
++#include "vm_core.h"
++
++/* Discard MRI override for snprintf because it assumes a Ruby thread and will
++ * try to check whether the stack has averflown, which will cause a SEGV.
++ */
++#undef snprintf
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <pthread.h>
++
++/* The default sampling tick before randomization is 5 milliseconds.
++ *
++ *   5,000,000 nanoseconds = 5 milliseconds = 0.005 seconds
++ *
++ * There are 23 bits necessary to represent 5,000,000. We choose a maximu
++ * random percentage of 30%, which requires 21 bits to represent. We read
++ * bytes of /dev/random and convert each 3 bytes into masked 21 bit values
++ * with the leading bit denoting the sign.
++ *
++ * NOTE: Setting RUBY_PROFILER_TICK in the env will change the pre-randomized
++ * sampling tick value, but this does not presently change the randomization
++ * percentage.
++ */
++
++#define SAMPLE_TICK         5000000
++#define NANO_PER_SEC        1000000000
++#define SAMPLES_PER_SEC     200
++#define RBYTES_PER_SAMPLE   3
++#define RBYTES              SAMPLES_PER_SEC * RBYTES_PER_SAMPLE
++#define RBYTE_VALUE(b, i)   (int)((b[i] | (b[i + 1] << 8) | (b[i + 2] & 0x1f) << 16) \
++                                * (b[i + 2] & 0x20 ? -1 : 1))
++
++typedef struct profiler_state {
++    pthread_t thread;
++    pthread_mutex_t mutex;
++    pthread_cond_t condvar;
++    struct timespec ts;
++    uint64_t nsec;
++    uint64_t sample_count;
++    int sample_tick;
++    int exit;
++    int pid;
++    int random[SAMPLES_PER_SEC];
++    int rvalue;
++    int stats;
++    int stats_fd;
++    char stats_path[PATH_MAX];
++} profiler_state;
++
++static profiler_state* ruby_profiler_state = NULL;
++
++// Insulate code from this global variable.
++static profiler_state*
++profiler_state_get(void)
++{
++    return ruby_profiler_state;
++}
++
++static void
++profiler_state_set(profiler_state* state)
++{
++    ruby_profiler_state = state;
++}
++
++static int
++profiler_enabled_p(void)
++{
++    return profiler_state_get() != NULL;
++}
++
++static void
++profiler_stats_close(profiler_state* state)
++{
++    if(state->stats) {
++        state->stats = false;
++
++        (void)close(state->stats_fd);
++        state->stats_fd = -1;
++
++        memset(state->stats_path, 0, PATH_MAX);
++    }
++}
++
++static void
++profiler_stats_open(profiler_state* state, char* path)
++{
++    if(strnlen(path, PATH_MAX+1) > PATH_MAX) return;
++
++    (void)strncpy(state->stats_path, path, PATH_MAX);
++    state->stats_path[PATH_MAX-1] = 0;
++
++    int fd = open(state->stats_path,
++        O_CREAT | O_TRUNC | O_WRONLY | O_APPEND,
++        S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++
++    if(fd < 0) {
++        fprintf(stderr, "Failed to open profiler stats path: %s, %s\n",
++            path, strerror(errno));
++        return;
++    }
++
++    state->stats_fd = fd;
++    state->stats = true;
++}
++
++static void
++profiler_stats_write_header(profiler_state* state)
++{
++    const char* header =
++        "PID, sample, random, random_percent, delta_sec, delta_nsec, delta_nsec_percent\n";
++
++    (void)write(state->stats_fd, header, strlen(header));
++}
++
++#define PROFILER_STAT_LEN   100
++
++static void
++profiler_stats_write_line(profiler_state* state)
++{
++    static char line[PROFILER_STAT_LEN];
++
++    struct timespec delta_ts;
++    clock_gettime(CLOCK_REALTIME, &delta_ts);
++
++    double random_percent = (double)state->rvalue / (double)state->sample_tick;
++
++    int64_t delta_sec = delta_ts.tv_sec - state->ts.tv_sec;
++    int64_t delta_nsec = delta_ts.tv_nsec - state->ts.tv_nsec;
++    double nsec_percent = (double)delta_nsec / (double)state->sample_tick;
++
++    int n = snprintf(line, PROFILER_STAT_LEN,
++        "%d, %lld, %d, %lf, %lld, %lld, %lf\n",
++        state->pid, state->sample_count,
++        state->rvalue, random_percent,
++        delta_sec, delta_nsec, nsec_percent);
++
++    (void)write(state->stats_fd, line, n);
++}
++
++static void
++profiler_fill_random(profiler_state* state)
++{
++    /* Since we are only loosely coordinated with the main Ruby process, it's
++     * possible that we could be running while Ruby runs exec(), so don't leak
++     * a file descriptor.
++     */
++    int fd = open("/dev/random", O_RDONLY | O_CLOEXEC);
++
++    if (fd < 0) {
++        fprintf(stderr, "Failed to open /dev/random for profiler: %s\n", strerror(errno));
++    }
++
++    char bytes[RBYTES];
++
++    size_t total = read(fd, bytes, RBYTES);
++
++    if(total < RBYTES) {
++        fprintf(stderr, "Failed to read /dev/random for profiler: %s\n", strerror(errno));
++        return;
++    }
++
++    size_t i;
++    int j;
++
++    for(j = i = 0; i < total; i += RBYTES_PER_SAMPLE, j++) {
++      state->random[j] = RBYTE_VALUE(bytes, i);
++    }
++}
++
++static void
++profiler_next_tick(profiler_state* state)
++{
++    int r = state->sample_count % SAMPLES_PER_SEC;
++    state->rvalue = state->random[r];
++
++    if (r == 0) {
++        profiler_fill_random(state);
++    }
++
++    state->nsec += state->sample_tick + state->rvalue;
++
++    if(state->nsec > NANO_PER_SEC) {
++      state->ts.tv_sec += 1;
++      state->nsec -= NANO_PER_SEC;
++    }
++
++    state->ts.tv_nsec = state->nsec;
++
++    state->sample_count++;
++}
++
++static void
++profiler_gvl_acquire(rb_vm_t* vm)
++{
++    rb_nativethread_cond_t* cond = &vm->gvl.cond;
++
++    pthread_mutex_lock(&vm->gvl.lock);
++
++    if (vm->gvl.acquired) {
++	vm->gvl.waiting++;
++
++	while (vm->gvl.acquired) {
++            pthread_cond_wait(&cond->cond, &vm->gvl.lock);
++	}
++
++	vm->gvl.waiting--;
++    }
++
++    vm->gvl.acquired = 1;
++
++    pthread_mutex_unlock(&vm->gvl.lock);
++}
++
++static void
++profiler_gvl_release(rb_vm_t* vm)
++{
++    vm->gvl.acquired = 0;
++
++    if (vm->gvl.waiting <= 0) return;
++
++    // See note for MRI 'native_cond_signal'.
++    rb_nativethread_cond_t* cond = &vm->gvl.cond;
++
++    int r;
++
++    do {
++        r = pthread_cond_signal(&cond->cond);
++    } while (r == EAGAIN);
++}
++
++static int
++profile_stack(rb_thread_t* th, profiler_state* state)
++{
++    /* Walk the stack
++
++    */
++
++    return 0;
++}
++
++static void
++profiler_sample(profiler_state* state)
++{
++    rb_vm_t *vm = GET_VM();
++
++    profiler_gvl_acquire(vm);
++
++    if(vm) {
++	rb_thread_t *th = 0;
++
++	list_for_each(&vm->living_threads, th, vmlt_node) {
++            profile_stack(th, state);
++	}
++    }
++
++    profiler_gvl_release(vm);
++}
++
++static void*
++profiler_function(void* arg)
++{
++    profiler_state* state = (profiler_state*)arg;
++
++    while(!state->exit) {
++        pthread_cond_timedwait(&state->condvar, &state->mutex, &state->ts);
++
++        // We may have been canceled while sleeping.
++        if(state->exit) break;
++
++        profiler_sample(state);
++
++        if(state->stats) {
++            profiler_stats_write_line(state);
++        }
++
++        profiler_next_tick(state);
++    }
++
++    return 0;
++}
++
++static void
++profiler_env_read_tick(profiler_state* state)
++{
++    char* tick = getenv("RUBY_PROFILER_TICK");
++
++    if (tick) {
++        int tick_value = atoi(tick);
++
++        if(tick_value > SAMPLE_TICK) {
++            state->sample_tick = tick_value;
++            return;
++        }
++    }
++
++    state->sample_tick = SAMPLE_TICK;
++}
++
++static void
++profiler_env_read_stats(profiler_state* state)
++{
++    char* stats = getenv("RUBY_PROFILER_STATS");
++
++    if(state->stats) {
++      // We are in the child of a process already collecting stats.
++      if(stats) {
++        if(strncmp(stats, state->stats_path, PATH_MAX)) {
++            profiler_stats_close(state);
++            profiler_stats_open(state, stats);
++            profiler_stats_write_header(state);
++        }
++      }
++      else {
++        profiler_stats_close(state);
++      }
++    }
++    else {
++        if(stats) {
++            profiler_stats_open(state, stats);
++            profiler_stats_write_header(state);
++        }
++    }
++}
++
++static void
++profiler_state_init(profiler_state* state)
++{
++    memset(state, 0, sizeof(profiler_state));
++
++    state->pid = (int)getpid();
++
++    profiler_env_read_tick(state);
++    profiler_env_read_stats(state);
++
++    clock_gettime(CLOCK_REALTIME, &state->ts);
++
++    /* We delay the first tick because we are not synchronized with the Ruby
++     * process and we want to avoid racing it as it sets up its data
++     * structures.
++     */
++    state->ts.tv_sec += 1;
++
++    state->nsec = state->ts.tv_nsec;
++}
++
++static void
++profiler_state_reset(profiler_state* state)
++{
++    pthread_mutex_destroy(&state->mutex);
++    pthread_cond_destroy(&state->condvar);
++}
++
++static void
++profiler_thread_create(profiler_state* state)
++{
++    pthread_mutex_init(&state->mutex, NULL);
++    pthread_cond_init(&state->condvar, NULL);
++
++    pthread_attr_t attrs;
++    pthread_attr_init(&attrs);
++    pthread_attr_setdetachstate(&attrs, PTHREAD_CREATE_JOINABLE);
++
++    int err = pthread_create(&state->thread, &attrs,
++        profiler_function, state);
++
++    if (err) {
++        fprintf(stderr, "Failed to create profiler thread: %s\n", strerror(err));
++    }
++
++    pthread_attr_destroy(&attrs);
++}
++
++static void
++profiler_fork_child(void)
++{
++    if(!profiler_enabled_p()) return;
++
++    profiler_state* state = profiler_state_get();
++
++    profiler_state_reset(state);
++
++    profiler_state_init(state);
++    profiler_thread_create(state);
++}
++
++static void
++profiler_atexit(void)
++{
++    if(!profiler_enabled_p()) return;
++
++    profiler_state* state = profiler_state_get();
++
++    state->exit = true;
++
++    pthread_cond_signal(&state->condvar);
++    pthread_join(state->thread, NULL);
++
++    profiler_stats_close(state);
++
++    profiler_state_reset(state);
++
++    free(state);
++    profiler_state_set(NULL);
++}
++
++void
++rb_thread_start_profiler_thread(void)
++{
++    if(!getenv("RUBY_PROFILER")) return;
++
++    profiler_state* state = (profiler_state*)malloc(sizeof(profiler_state));
++
++    profiler_state_init(state);
++    profiler_state_set(state);
++
++    profiler_thread_create(state);
++
++    pthread_atfork(NULL, NULL, profiler_fork_child);
++
++    atexit(profiler_atexit);
++}
+diff --git a/thread.c b/thread.c
+index d7e0d91d7f..c2e579f3d5 100644
+--- a/thread.c
++++ b/thread.c
+@@ -4948,6 +4948,8 @@ Init_Thread(void)
+ 
+     rb_thread_create_timer_thread();
+ 
++    rb_thread_start_profiler_thread();
++
+     /* suppress warnings on cygwin, mingw and mswin.*/
+     (void)native_mutex_trylock;
+ 
+diff --git a/vm_core.h b/vm_core.h
+index cfe0042c25..6db8ee046f 100644
+--- a/vm_core.h
++++ b/vm_core.h
+@@ -1521,6 +1521,8 @@ void rb_thread_stop_timer_thread(void);
+ void rb_thread_reset_timer_thread(void);
+ void rb_thread_wakeup_timer_thread(void);
+ 
++void rb_thread_start_profiler_thread(void);
++
+ static inline void
+ rb_vm_living_threads_init(rb_vm_t *vm)
+ {
