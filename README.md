@@ -38,15 +38,24 @@ CSV with the following columns:
 
 ### Using ruby-install
 
+For information about using `ruby-install`, see [the ruby-install
+docs](https://github.com/postmodern/ruby-install)
+
     $ ruby-install -p https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-2.1/profiler.diff ruby 2.1.10
 
 ### Using ruby-build
 
-    $ TODO
+For information about using `rbenv` and `ruby-build`, see [the ruby-build
+docs](https://github.com/rbenv/ruby-build).
+
+    $ rbenv install --patch 2.1.10 < <(curl -sSL https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-2.1/profiler.diff)
 
 ### Using RVM
 
-    $ TODO
+For information about using `rvm`, see [the RVM
+docs](https://rvm.io/rubies/patching).
+
+    $ rvm install 2.1.10 --patch https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-2.1/profiler.diff
 
 # License
 
