@@ -2,6 +2,7 @@ language: c
 compiler:
 - clang
 - gcc
+script: ruby-install -p https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-$TEST_RUBY_X.$TEST_RUBY_Y/profiler.diff ruby $TEST_RUBY_X.$TEST_RUBY_Y.$TEST_RUBY_Z
 matrix:
   include:
   - name: "2.1"
@@ -29,4 +30,3 @@ matrix:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=5
       - TEST_RUBY_Z=1
-  script: ruby-install -p https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-$TEST_RUBY_X.$TEST_RUBY_Y/profiler.diff ruby $TEST_RUBY_X.$TEST_RUBY_Y.$TEST_RUBY_Z
