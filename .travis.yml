@@ -7,8 +7,14 @@ install:
 script: ruby-install -p https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-$TEST_RUBY_X.$TEST_RUBY_Y/profiler.diff ruby $TEST_RUBY_X.$TEST_RUBY_Y.$TEST_RUBY_Z
 matrix:
   include:
-  - name: "2.1"
+  - name: "2.1 Clang"
     compiler: clang
+    env:
+      - TEST_RUBY_X=2
+      - TEST_RUBY_Y=1
+      - TEST_RUBY_Z=10
+  - name: "2.1 GCC"
+    compiler: gcc
     env:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=1
@@ -31,8 +37,14 @@ matrix:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=4
       - TEST_RUBY_Z=4
-  - name: "2.5"
+  - name: "2.5 Clang"
     compiler: clang
+    env:
+      - TEST_RUBY_X=2
+      - TEST_RUBY_Y=5
+      - TEST_RUBY_Z=1
+  - name: "2.5 GCC"
+    compiler: gcc
     env:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=5
