@@ -21,10 +21,10 @@ index d2a4edd2a7..da4235f0f4 100644
  range.$(OBJEXT): {$(VPATH)}range.c $(RUBY_H_INCLUDES) \
 diff --git a/profiler.c b/profiler.c
 new file mode 100644
-index 0000000000..25f72fa20f
+index 0000000000..8821df4943
 --- /dev/null
 +++ b/profiler.c
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,517 @@
 +#include "ruby/ruby.h"
 +#include "ruby/st.h"
 +#include "vm_core.h"
@@ -77,8 +77,9 @@ index 0000000000..25f72fa20f
 +    uint64_t sample_count;
 +    int sample_tick;
 +    int exit;
-+    int paused;
 +    int fork_pending;
++    int running;
++    int paused;
 +    int pid;
 +    int random[SAMPLES_PER_SEC];
 +    int rvalue;
@@ -210,13 +211,13 @@ index 0000000000..25f72fa20f
 +static void
 +profiler_pause_for_fork(profiler_state* state)
 +{
-+    struct timespec ts = { 0, PAUSE_NANOSECONDS }
++    struct timespec ts = { 0, PAUSE_NANOSECONDS };
 +
 +    state->paused = true;
 +
 +    pthread_mutex_unlock(&state->mutex);
 +
-+    while(state-fork_pending) {
++    while(state->fork_pending) {
 +      nanosleep(&ts, NULL);
 +
 +      // TODO: memory fence, we can't rely on mutex for memory synchronization
@@ -321,6 +322,8 @@ index 0000000000..25f72fa20f
 +{
 +    profiler_state* state = (profiler_state*)arg;
 +
++    state->running = true;
++
 +    pthread_mutex_lock(&state->mutex);
 +
 +    while(!state->exit) {
@@ -340,6 +343,8 @@ index 0000000000..25f72fa20f
 +
 +        profiler_next_tick(state);
 +    }
++
++    state->running = false;
 +
 +    pthread_mutex_unlock(&state->mutex);
 +
@@ -466,6 +471,7 @@ index 0000000000..25f72fa20f
 +    state->fork_pending = false;
 +
 +    pthread_cond_signal(&state->condvar);
++    pthread_mutex_unlock(&state->mutex);
 +}
 +
 +static void
@@ -486,10 +492,31 @@ index 0000000000..25f72fa20f
 +
 +    profiler_state* state = profiler_state_get();
 +
-+    state->exit = true;
++    int mutex_status;
 +
-+    pthread_cond_signal(&state->condvar);
-+    pthread_join(state->thread, NULL);
++    while(state->running) {
++      state->exit = true;
++
++      mutex_status = pthread_mutex_trylock(&state->mutex);
++
++      switch(mutex_status) {
++        case 0:
++            pthread_cond_signal(&state->condvar);
++            pthread_mutex_unlock(&state->mutex);
++            break;
++        case EINVAL:
++            break;
++        case EBUSY:
++            continue;
++        default:
++            fprintf(stderr, "Failed to halt profiler thread: %s\n", strerror(errno));
++            break;
++      }
++    }
++
++    if(mutex_status == 0) {
++        pthread_join(state->thread, NULL);
++    }
 +
 +    profiler_stats_close(state);
 +
@@ -511,7 +538,7 @@ index 0000000000..25f72fa20f
 +
 +    profiler_thread_create(state);
 +
-+    pthread_atfork(NULL, NULL, profiler_fork_child);
++    pthread_atfork(profiler_fork_prepare, profiler_fork_parent, profiler_fork_child);
 +
 +    atexit(profiler_atexit);
 +}
