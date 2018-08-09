@@ -21,10 +21,10 @@ index d2a4edd2a7..da4235f0f4 100644
  range.$(OBJEXT): {$(VPATH)}range.c $(RUBY_H_INCLUDES) \
 diff --git a/profiler.c b/profiler.c
 new file mode 100644
-index 0000000000..8e7f5be96b
+index 0000000000..25f72fa20f
 --- /dev/null
 +++ b/profiler.c
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,490 @@
 +#include "ruby/ruby.h"
 +#include "ruby/st.h"
 +#include "vm_core.h"
@@ -49,7 +49,7 @@ index 0000000000..8e7f5be96b
 + *
 + *   5,000,000 nanoseconds = 5 milliseconds = 0.005 seconds
 + *
-+ * There are 23 bits necessary to represent 5,000,000. We choose a maximu
++ * There are 23 bits necessary to represent 5,000,000. We choose a maximum
 + * random percentage of 30%, which requires 21 bits to represent. We read
 + * bytes of /dev/random and convert each 3 bytes into masked 21 bit values
 + * with the leading bit denoting the sign.
@@ -61,6 +61,7 @@ index 0000000000..8e7f5be96b
 +
 +#define SAMPLE_TICK         5000000
 +#define NANO_PER_SEC        1000000000
++#define PAUSE_NANOSECONDS   1000000
 +#define SAMPLES_PER_SEC     200
 +#define RBYTES_PER_SAMPLE   3
 +#define RBYTES              SAMPLES_PER_SEC * RBYTES_PER_SAMPLE
@@ -76,6 +77,8 @@ index 0000000000..8e7f5be96b
 +    uint64_t sample_count;
 +    int sample_tick;
 +    int exit;
++    int paused;
++    int fork_pending;
 +    int pid;
 +    int random[SAMPLES_PER_SEC];
 +    int rvalue;
@@ -205,6 +208,26 @@ index 0000000000..8e7f5be96b
 +}
 +
 +static void
++profiler_pause_for_fork(profiler_state* state)
++{
++    struct timespec ts = { 0, PAUSE_NANOSECONDS }
++
++    state->paused = true;
++
++    pthread_mutex_unlock(&state->mutex);
++
++    while(state-fork_pending) {
++      nanosleep(&ts, NULL);
++
++      // TODO: memory fence, we can't rely on mutex for memory synchronization
++    }
++
++    state->paused = false;
++
++    pthread_mutex_lock(&state->mutex);
++}
++
++static void
 +profiler_next_tick(profiler_state* state)
 +{
 +    int r = state->sample_count % SAMPLES_PER_SEC;
@@ -298,11 +321,16 @@ index 0000000000..8e7f5be96b
 +{
 +    profiler_state* state = (profiler_state*)arg;
 +
++    pthread_mutex_lock(&state->mutex);
++
 +    while(!state->exit) {
 +        pthread_cond_timedwait(&state->condvar, &state->mutex, &state->ts);
 +
 +        // We may have been canceled while sleeping.
 +        if(state->exit) break;
++
++        // Pause if the process is attempting to fork().
++        if(state->fork_pending) profiler_pause_for_fork(state);
 +
 +        profiler_sample(state);
 +
@@ -312,6 +340,8 @@ index 0000000000..8e7f5be96b
 +
 +        profiler_next_tick(state);
 +    }
++
++    pthread_mutex_unlock(&state->mutex);
 +
 +    return 0;
 +}
@@ -408,13 +438,42 @@ index 0000000000..8e7f5be96b
 +}
 +
 +static void
-+profiler_fork_child(void)
++profiler_fork_prepare(void)
 +{
 +    if(!profiler_enabled_p()) return;
 +
 +    profiler_state* state = profiler_state_get();
 +
-+    profiler_state_reset(state);
++    while(!state->paused) {
++      pthread_mutex_lock(&state->mutex);
++
++      state->fork_pending = true;
++
++      pthread_cond_signal(&state->condvar);
++      pthread_mutex_unlock(&state->mutex);
++    }
++}
++
++static void
++profiler_fork_parent(void)
++{
++    if(!profiler_enabled_p()) return;
++
++    profiler_state* state = profiler_state_get();
++
++    pthread_mutex_lock(&state->mutex);
++
++    state->fork_pending = false;
++
++    pthread_cond_signal(&state->condvar);
++}
++
++static void
++profiler_fork_child(void)
++{
++    if(!profiler_enabled_p()) return;
++
++    profiler_state* state = profiler_state_get();
 +
 +    profiler_state_init(state);
 +    profiler_thread_create(state);
