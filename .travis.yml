@@ -1,31 +1,38 @@
 language: c
-compiler:
-- clang
-- gcc
+install:
+  - wget -O ruby-install-0.7.0.tar.gz https://github.com/postmodern/ruby-install/archive/v0.7.0.tar.gz
+  - tar -xzvf ruby-install-0.7.0.tar.gz
+  - cd ruby-install-0.7.0/
+  - sudo make install
 script: ruby-install -p https://raw.githubusercontent.com/brixen/ruby_sampling_profiler/master/ruby-$TEST_RUBY_X.$TEST_RUBY_Y/profiler.diff ruby $TEST_RUBY_X.$TEST_RUBY_Y.$TEST_RUBY_Z
 matrix:
   include:
   - name: "2.1"
+    compiler: clang
     env:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=1
       - TEST_RUBY_Z=10
   - name: "2.2"
+    compiler: clang
     env:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=2
       - TEST_RUBY_Z=10
   - name: "2.3"
+    compiler: clang
     env:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=3
       - TEST_RUBY_Z=7
   - name: "2.4"
+    compiler: clang
     env:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=4
       - TEST_RUBY_Z=4
   - name: "2.5"
+    compiler: clang
     env:
       - TEST_RUBY_X=2
       - TEST_RUBY_Y=5
