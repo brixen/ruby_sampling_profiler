@@ -21,10 +21,10 @@ index d2a4edd2a7..da4235f0f4 100644
  range.$(OBJEXT): {$(VPATH)}range.c $(RUBY_H_INCLUDES) \
 diff --git a/profiler.c b/profiler.c
 new file mode 100644
-index 0000000000..8821df4943
+index 0000000000..ab5a8cee8e
 --- /dev/null
 +++ b/profiler.c
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,526 @@
 +#include "ruby/ruby.h"
 +#include "ruby/st.h"
 +#include "vm_core.h"
@@ -304,15 +304,21 @@ index 0000000000..8821df4943
 +}
 +
 +static void
++profiler_threads_iterate(profiler_state* state, rb_vm_t* vm)
++{
++    if(vm && vm->living_threads) {
++        st_foreach(vm->living_threads, profile_stack, (st_data_t)state);
++    }
++}
++
++static void
 +profiler_sample(profiler_state* state)
 +{
 +    rb_vm_t *vm = GET_VM();
 +
 +    profiler_gvl_acquire(vm);
 +
-+    if(vm && vm->living_threads) {
-+        st_foreach(vm->living_threads, profile_stack, (st_data_t)state);
-+    }
++    profiler_threads_iterate(state, vm);
 +
 +    profiler_gvl_release(vm);
 +}
@@ -334,6 +340,9 @@ index 0000000000..8821df4943
 +
 +        // Pause if the process is attempting to fork().
 +        if(state->fork_pending) profiler_pause_for_fork(state);
++
++        // We may have been canceled while pausing for fork().
++        if(state->exit) break;
 +
 +        profiler_sample(state);
 +
