@@ -1,5 +1,7 @@
 # Ruby Randomized Sampling Profiler
 
+[![Build Status](https://travis-ci.org/brixen/ruby_sampling_profiler.svg?branch=master)](https://travis-ci.org/brixen/ruby_sampling_profiler)
+
 The patches here implement modifications to Ruby's source code to add a
 randomized sampling profiler.
 
