@@ -21,11 +21,12 @@ index d2a4edd2a7..da4235f0f4 100644
  range.$(OBJEXT): {$(VPATH)}range.c $(RUBY_H_INCLUDES) \
 diff --git a/profiler.c b/profiler.c
 new file mode 100644
-index 0000000000..ab5a8cee8e
+index 0000000000..e700a55edc
 --- /dev/null
 +++ b/profiler.c
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,597 @@
 +#include "ruby/ruby.h"
++#include "ruby/debug.h"
 +#include "ruby/st.h"
 +#include "vm_core.h"
 +
@@ -44,6 +45,7 @@ index 0000000000..ab5a8cee8e
 +#include <string.h>
 +#include <unistd.h>
 +#include <pthread.h>
++#include <sys/mman.h>
 +
 +/* The default sampling tick before randomization is 5 milliseconds.
 + *
@@ -63,10 +65,13 @@ index 0000000000..ab5a8cee8e
 +#define NANO_PER_SEC        1000000000
 +#define PAUSE_NANOSECONDS   1000000
 +#define SAMPLES_PER_SEC     200
++#define FRAMES_LEN          250000 * sizeof(VALUE)
 +#define RBYTES_PER_SAMPLE   3
 +#define RBYTES              SAMPLES_PER_SEC * RBYTES_PER_SAMPLE
-+#define RBYTE_VALUE(b, i)   (int)((b[i] | (b[i + 1] << 8) | (b[i + 2] & 0x1f) << 16) \
-+                                * (b[i + 2] & 0x20 ? -1 : 1))
++#define RBYTE_VALUE(b, i)   (int)(((b)[i] | ((b)[i + 1] << 8) | ((b)[i + 2] & 0x1f) << 16) \
++                                * ((b)[i + 2] & 0x20 ? -1 : 1))
++#define INTERVAL_COUNT(v)   ((v) & 0xff)
++#define INTERVAL_VALUE(v)   (((v) < 0 ? -(v) : (v)) * 1000)
 +
 +typedef struct profiler_state {
 +    pthread_t thread;
@@ -75,6 +80,12 @@ index 0000000000..ab5a8cee8e
 +    struct timespec ts;
 +    uint64_t nsec;
 +    uint64_t sample_count;
++    uint64_t gc_sample_count;
++    uint64_t interval_count;
++    VALUE* frames;
++    int frames_len;
++    int frames_max;
++    int frames_index;
 +    int sample_tick;
 +    int exit;
 +    int fork_pending;
@@ -208,6 +219,15 @@ index 0000000000..ab5a8cee8e
 +    }
 +}
 +
++static void profiler_gc_mark(void* arg)
++{
++    profiler_state* state = (profiler_state*)arg;
++
++    for(int i = 0; i < state->frames_max; i++) {
++        rb_gc_mark(state->frames[i]);
++    }
++}
++
 +static void
 +profiler_pause_for_fork(profiler_state* state)
 +{
@@ -238,11 +258,16 @@ index 0000000000..ab5a8cee8e
 +        profiler_fill_random(state);
 +    }
 +
-+    state->nsec += state->sample_tick + state->rvalue;
++    if (state->sample_count > state->interval_count) {
++      state->interval_count += INTERVAL_COUNT(state->rvalue);
++      state->nsec += INTERVAL_VALUE(state->rvalue);
++    } else {
++      state->nsec += state->sample_tick + state->rvalue;
++    }
 +
-+    if(state->nsec > NANO_PER_SEC) {
-+      state->ts.tv_sec += 1;
-+      state->nsec -= NANO_PER_SEC;
++    if (state->nsec > NANO_PER_SEC) {
++      state->ts.tv_sec += state->nsec / NANO_PER_SEC;
++      state->nsec = state->nsec % NANO_PER_SEC;
 +    }
 +
 +    state->ts.tv_nsec = state->nsec;
@@ -294,11 +319,15 @@ index 0000000000..ab5a8cee8e
 +{
 +    rb_thread_t *th;
 +    GetThreadPtr((VALUE)key, th);
-+
-+    /* Walk the stack
++    rb_control_frame_t *cfp = th->cfp,
++                       *end_cfp = RUBY_VM_END_CONTROL_FRAME(th);
 +    profiler_state* state = (profiler_state*)arg;
 +
-+    */
++    for (int i = 0; cfp != end_cfp; i++, cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp)) {
++        if (cfp->iseq && cfp->pc && state->frames_index < state->frames_max) {
++            state->frames[state->frames_index++] = cfp->iseq->self;
++        }
++    }
 +
 +    return 0;
 +}
@@ -314,9 +343,18 @@ index 0000000000..ab5a8cee8e
 +static void
 +profiler_sample(profiler_state* state)
 +{
++    if (rb_during_gc()) {
++        state->gc_sample_count++;
++        return;
++    }
++
 +    rb_vm_t *vm = GET_VM();
 +
++    if (!vm) return;
++
 +    profiler_gvl_acquire(vm);
++
++    state->frames_index = 0;
 +
 +    profiler_threads_iterate(state, vm);
 +
@@ -333,7 +371,12 @@ index 0000000000..ab5a8cee8e
 +    pthread_mutex_lock(&state->mutex);
 +
 +    while(!state->exit) {
-+        pthread_cond_timedwait(&state->condvar, &state->mutex, &state->ts);
++        int err = pthread_cond_timedwait(&state->condvar, &state->mutex, &state->ts);
++
++        if (err == EINVAL) {
++            fprintf(stderr, "Error waiting in profiler thread : %s\n", strerror(err));
++            break;
++        }
 +
 +        // We may have been canceled while sleeping.
 +        if(state->exit) break;
@@ -413,6 +456,18 @@ index 0000000000..ab5a8cee8e
 +    profiler_env_read_tick(state);
 +    profiler_env_read_stats(state);
 +
++    state->frames = (VALUE*)mmap(NULL, FRAMES_LEN, PROT_READ | PROT_WRITE,
++        MAP_ANON | MAP_PRIVATE, -1, 0);
++
++    if (state->frames == MAP_FAILED) {
++      fprintf(stderr, "Failed to mmap frames memory: %s\n", strerror(errno));
++      state->frames_len = 0;
++    } else {
++      state->frames_len = FRAMES_LEN;
++    }
++
++    state->frames_max = state->frames_len / sizeof(VALUE);
++
 +    clock_gettime(CLOCK_REALTIME, &state->ts);
 +
 +    /* We delay the first tick because we are not synchronized with the Ruby
@@ -425,10 +480,25 @@ index 0000000000..ab5a8cee8e
 +}
 +
 +static void
++profiler_state_wrap(profiler_state* state)
++{
++    VALUE obj = Data_Wrap_Struct(rb_cObject, profiler_gc_mark, NULL, state);
++
++    // TODO connect to existing constant
++    rb_global_variable(&obj);
++}
++
++static void
 +profiler_state_reset(profiler_state* state)
 +{
 +    pthread_mutex_destroy(&state->mutex);
 +    pthread_cond_destroy(&state->condvar);
++
++    if (state->frames_len && state->frames) {
++      if(munmap(state->frames, state->frames_len) != 0) {
++        fprintf(stderr, "Failed to unmap frames memory: %s\n", strerror(errno));
++      }
++    }
 +}
 +
 +static void
@@ -543,6 +613,7 @@ index 0000000000..ab5a8cee8e
 +    profiler_state* state = (profiler_state*)malloc(sizeof(profiler_state));
 +
 +    profiler_state_init(state);
++    profiler_state_wrap(state);
 +    profiler_state_set(state);
 +
 +    profiler_thread_create(state);
